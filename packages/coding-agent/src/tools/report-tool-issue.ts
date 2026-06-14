@@ -22,8 +22,9 @@
 import { Database } from "bun:sqlite";
 import path from "node:path";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import { $env, $flag, getAgentDir, getInstallId, logger, VERSION } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import type { Settings } from "..";
 import type { ToolSession } from "./index";
 
@@ -205,10 +206,11 @@ export function openAutoQaDb(): Database | null {
 	if (cachedDb) return cachedDb;
 	try {
 		const db = new Database(getAutoQaDbPath());
+		// Install the busy handler BEFORE any lock-taking statement. See #2421.
+		db.run("PRAGMA busy_timeout = 5000");
 		db.run(`
 			PRAGMA journal_mode=WAL;
 			PRAGMA synchronous=NORMAL;
-			PRAGMA busy_timeout=5000;
 			CREATE TABLE IF NOT EXISTS grievances (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				model TEXT NOT NULL,
@@ -260,6 +262,10 @@ export interface FlushOptions {
 	 * future debug recipes); never set from the tool's auto-flush path.
 	 */
 	bypassConsent?: boolean;
+	/**
+	 * Fetch implementation for the push POST. Defaults to global fetch.
+	 */
+	fetch?: FetchImpl;
 	/**
 	 * Fires once at the start of the loop with the snapshot count of
 	 * unpushed rows. Subsequent inserts won't be reflected (the count is
@@ -345,6 +351,7 @@ async function performFlush(db: Database, config: PushConfig, options: FlushOpti
 		const totalRow = db.prepare("SELECT COUNT(*) AS n FROM grievances WHERE pushed = 0").get() as { n: number };
 		options.onStart(totalRow.n);
 	}
+	const fetchImpl = options.fetch ?? fetch;
 	let totalPushed = 0;
 	for (;;) {
 		const rows = selectStmt.all(FLUSH_BATCH_SIZE) as GrievanceRow[];
@@ -366,7 +373,7 @@ async function performFlush(db: Database, config: PushConfig, options: FlushOpti
 
 		let response: Response;
 		try {
-			response = await fetch(config.endpoint, {
+			response = await fetchImpl(config.endpoint, {
 				method: "POST",
 				headers,
 				body,

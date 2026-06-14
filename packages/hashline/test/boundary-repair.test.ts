@@ -138,6 +138,19 @@ describe("boundary-balance repair", () => {
 		expect(warnings.some(w => /delimiter-balance/.test(w))).toBe(true);
 	});
 
+	// If the selected range is already imbalanced internally, a payload that
+	// restates the range's final closer must not trigger "missing closer" repair;
+	// keeping the deleted suffix would duplicate the closer outside the payload.
+	it("does not spare a deleted closing line that the payload already restates", () => {
+		const file = ["class Foo {", "\tok();", "\t}", "}"].join("\n");
+		const diff = ["replace 1..4:", "+class Foo {", "+\tok();", "+}"].join("\n");
+		const { text, warnings } = apply(file, diff);
+
+		expect(text).toBe(["class Foo {", "\tok();", "}"].join("\n"));
+		expect(text.split("\n").filter(line => line === "}")).toHaveLength(1);
+		expect(warnings).toHaveLength(0);
+	});
+
 	it("drops duplicated leading and trailing boundary lines around a range replacement", () => {
 		const file = [
 			"func _cmd_travel_homeworld():",
@@ -186,6 +199,34 @@ describe("boundary-balance repair", () => {
 
 		expect(text).toBe(["a", "a", "c", "c"].join("\n"));
 		expect(warnings).toHaveLength(0);
+	});
+
+	// An echo whose dropped edges shift delimiter balance without explaining a
+	// payload/range delta is intentional structural content, not a boundary
+	// mistake: stripping the edges would corrupt the brace structure.
+	it("preserves balance-shifting boundary echoes that do not explain the delta", () => {
+		const file = ["}", "old();", "}"].join("\n");
+		// Payload deliberately opens with the same bare `}` that sits above the
+		// range and closes with the same `}` that sits below it; the payload is
+		// internally balanced (delta 0) while the dropped edges sum to -2 braces.
+		const diff = ["replace 2..2:", "+}", "+if (a) {", "+if (b) {", "+x();", "+}"].join("\n");
+
+		const { text, warnings } = apply(file, diff);
+
+		expect(text).toBe(["}", "}", "if (a) {", "if (b) {", "x();", "}", "}"].join("\n"));
+		expect(warnings).toHaveLength(0);
+	});
+
+	// The common wrapper-echo mistake stays repaired: balance-neutral edges
+	// (opener + closer) that duplicate the surviving neighbors are dropped.
+	it("still drops a balance-neutral wrapper echo", () => {
+		const file = ["function f() {", "old();", "}"].join("\n");
+		const diff = ["replace 2..2:", "+function f() {", "+fresh();", "+}"].join("\n");
+
+		const { text, warnings } = apply(file, diff);
+
+		expect(text).toBe(["function f() {", "fresh();", "}"].join("\n"));
+		expect(warnings.some(warning => /boundary echo/.test(warning))).toBe(true);
 	});
 
 	// Balance-preserving edits are never touched, even when the payload's last

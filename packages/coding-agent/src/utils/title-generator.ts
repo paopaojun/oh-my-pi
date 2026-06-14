@@ -9,12 +9,16 @@ import type { ModelRegistry } from "../config/model-registry";
 
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
+import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
+import titleMarkerSystemPrompt from "../prompts/system/title-system-marker.md" with { type: "text" };
 import { ONLINE_TINY_TITLE_MODEL_KEY } from "../tiny/models";
 import { formatTitleUserMessage, isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
 import { tinyTitleClient } from "../tiny/title-client";
 
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
+const TITLE_MARKER_SYSTEM_PROMPT = prompt.render(titleMarkerSystemPrompt);
+const TITLE_MARKER_INSTRUCTION = prompt.render(titleMarkerInstruction);
 
 const DEFAULT_TERMINAL_TITLE = "π";
 const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
@@ -33,13 +37,30 @@ const setTitleTool: Tool = {
 			title: {
 				type: "string",
 				description:
-					'A concise 3-6 word title for the session, or exactly "none" when the message carries no concrete task yet (greeting, small talk, vague).',
+					'The generated session title, or exactly "none" when the message carries no concrete task yet.',
 			},
 		},
 		required: ["title"],
 		additionalProperties: false,
 	},
 };
+
+/** Matches the title a tool-choice-less model wraps in `<title>...</title>`. */
+const TITLE_MARKER_RE = /<title>([\s\S]*?)<\/title>/i;
+
+/**
+ * Whether the model honors a forced `tool_choice` so the `set_title` tool can be
+ * required. Providers/models that reject forced tool calls (chat-completions
+ * hosts without `tool_choice` support, Claude Fable/Mythos) can't be made to
+ * emit a structured call, so the caller falls back to marker-wrapped text.
+ */
+function modelSupportsForcedToolChoice(model: Model<Api>): boolean {
+	const compat = model.compat;
+	if (!compat) return true;
+	if ("supportsForcedToolChoice" in compat) return compat.supportsForcedToolChoice;
+	if ("supportsToolChoice" in compat) return compat.supportsToolChoice;
+	return true;
+}
 
 function getTitleModel(registry: ModelRegistry, settings: Settings, currentModel?: Model<Api>): Model<Api> | undefined {
 	const availableModels = registry.getAvailable();
@@ -137,6 +158,7 @@ export async function raceFirstNonNull<T>(
  *   to produce request metadata (e.g. user_id for session attribution). Using a
  *   resolver instead of a pre-evaluated value ensures the metadata's account_uuid
  *   reflects the credential actually selected for this request.
+ * @param customSystemPrompt Optional title-specific system prompt override
  */
 export async function generateSessionTitle(
 	firstMessage: string,
@@ -145,6 +167,7 @@ export async function generateSessionTitle(
 	sessionId?: string,
 	currentModel?: Model<Api>,
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined,
+	customSystemPrompt?: string,
 ): Promise<string | null> {
 	// Defer titling for greetings / acknowledgements / empty input. The default
 	// tiny title model can't reliably decline trivial input, so this happens
@@ -155,13 +178,26 @@ export async function generateSessionTitle(
 		return null;
 	}
 
+	const titleSystemPrompt = customSystemPrompt?.trim() || undefined;
 	const tinyModel = settings.get("providers.tinyModel");
 	if (tinyModel === ONLINE_TINY_TITLE_MODEL_KEY) {
-		return generateTitleOnline(firstMessage, registry, settings, sessionId, currentModel, metadataResolver);
+		return generateTitleOnline(
+			firstMessage,
+			registry,
+			settings,
+			sessionId,
+			currentModel,
+			metadataResolver,
+			undefined,
+			titleSystemPrompt,
+		);
 	}
 
 	const onlineAbortController = new AbortController();
-	const localTitle = tinyTitleClient.generate(tinyModel, firstMessage).then(
+	const localTitlePromise = titleSystemPrompt
+		? tinyTitleClient.generate(tinyModel, firstMessage, { systemPrompt: titleSystemPrompt })
+		: tinyTitleClient.generate(tinyModel, firstMessage);
+	const localTitle = localTitlePromise.then(
 		title => title || null,
 		err => {
 			logger.warn("title-generator: local model error", {
@@ -181,6 +217,7 @@ export async function generateSessionTitle(
 			currentModel,
 			metadataResolver,
 			onlineAbortController.signal,
+			titleSystemPrompt,
 		);
 
 	return raceFirstNonNull(localTitle, startOnline, TITLE_LOCAL_FALLBACK_DELAY_MS, () => {
@@ -196,6 +233,7 @@ export async function generateTitleOnline(
 	currentModel?: Model<Api>,
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined,
 	signal?: AbortSignal,
+	customSystemPrompt?: string,
 ): Promise<string | null> {
 	const model = getTitleModel(registry, settings, currentModel);
 	if (!model) {
@@ -203,6 +241,17 @@ export async function generateTitleOnline(
 		return null;
 	}
 
+	const titleSystemPrompt = customSystemPrompt?.trim() || undefined;
+	// Some providers can't be forced to call a tool — chat-completions hosts
+	// without `tool_choice` support, Claude Fable/Mythos — so a required
+	// `set_title` call never arrives. For those, ask the model to wrap the title
+	// in `<title>...</title>` markers and parse it from text instead.
+	const useForcedTool = modelSupportsForcedToolChoice(model);
+	const systemPrompt = useForcedTool
+		? [titleSystemPrompt ?? TITLE_SYSTEM_PROMPT]
+		: titleSystemPrompt
+			? [titleSystemPrompt, TITLE_MARKER_INSTRUCTION]
+			: [TITLE_MARKER_SYSTEM_PROMPT];
 	const userMessage = formatTitleUserMessage(firstMessage);
 	const modelName = `${model.provider}/${model.id}`;
 	const modelContext = {
@@ -224,7 +273,7 @@ export async function generateTitleOnline(
 		// account_uuid rather than the snapshot-at-call-site value.
 		const metadata = metadataResolver?.(model.provider);
 
-		// Title generation is a 3-6 word task, but some reasoning backends ignore
+		// Title generation is a 3-7 word task, but some reasoning backends ignore
 		// disableReasoning. Keep the normal cheap budget for non-reasoning models
 		// while reserving enough output room for reasoning models to still emit
 		// the forced tool call after any unavoidable thinking tokens.
@@ -234,15 +283,15 @@ export async function generateTitleOnline(
 		const response = await completeSimple(
 			model,
 			{
-				systemPrompt: [TITLE_SYSTEM_PROMPT],
+				systemPrompt,
 				messages: [{ role: "user", content: userMessage, timestamp: Date.now() }],
-				tools: [setTitleTool],
+				tools: useForcedTool ? [setTitleTool] : undefined,
 			},
 			{
-				apiKey: registry.resolver(model.provider, { sessionId, baseUrl: model.baseUrl }),
+				apiKey: registry.resolver(model, sessionId),
 				maxTokens,
 				disableReasoning: true,
-				toolChoice: { type: "tool", name: SET_TITLE_TOOL_NAME },
+				toolChoice: useForcedTool ? { type: "tool", name: SET_TITLE_TOOL_NAME } : undefined,
 				metadata,
 				signal,
 			},
@@ -300,7 +349,13 @@ function extractGeneratedTitle(contentBlocks: AssistantMessage["content"]): stri
 			textTitle += content.text;
 		}
 	}
-	return textTitle.trim();
+	// Tool-choice-less models are asked to wrap the title in <title>...</title>,
+	// but stay lenient: prefer the marker when the model closed it, otherwise
+	// accept a plain sentence after stripping any stray/unclosed tag fragment
+	// (e.g. output truncated before the closing tag).
+	const marker = TITLE_MARKER_RE.exec(textTitle);
+	if (marker) return marker[1].trim();
+	return textTitle.replace(/<\/?title>/gi, "").trim();
 }
 
 /**

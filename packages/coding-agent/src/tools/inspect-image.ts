@@ -2,10 +2,10 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import { instrumentedCompleteSimple, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import { type Api, completeSimple, type Model } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import { extractTextContent } from "../commit/utils";
 
-import { expandRoleAlias, resolveModelFromString } from "../config/model-resolver";
+import { expandRoleAlias, getModelMatchPreferences, resolveModelFromString } from "../config/model-resolver";
 import inspectImageDescription from "../prompts/tools/inspect-image.md" with { type: "text" };
 import inspectImageSystemPromptTemplate from "../prompts/tools/inspect-image-system.md" with { type: "text" };
 import {
@@ -13,6 +13,7 @@ import {
 	type LoadedImageInput,
 	loadImageInput,
 	MAX_IMAGE_INPUT_BYTES,
+	webpExclusionForModel,
 } from "../utils/image-loading";
 import type { ToolSession } from "./index";
 import { ToolError } from "./tool-errors";
@@ -72,7 +73,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 			throw new ToolError("No models available for inspect_image.");
 		}
 
-		const matchPreferences = { usageOrder: this.session.settings.getStorage()?.getModelUsageOrder() };
+		const matchPreferences = getModelMatchPreferences(this.session.settings);
 		const resolvePattern = (pattern: string | undefined): Model<Api> | undefined => {
 			if (!pattern) return undefined;
 			const expanded = expandRoleAlias(pattern, this.session.settings);
@@ -109,6 +110,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 				cwd: this.session.cwd,
 				autoResize: this.session.settings.get("images.autoResize"),
 				maxBytes: MAX_IMAGE_INPUT_BYTES,
+				excludeWebP: webpExclusionForModel(model),
 			});
 		} catch (error) {
 			if (error instanceof ImageInputTooLargeError) {
@@ -138,10 +140,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 				],
 			},
 			{
-				apiKey: modelRegistry.resolver(model.provider, {
-					sessionId: this.session.getSessionId?.() ?? undefined,
-					baseUrl: model.baseUrl,
-				}),
+				apiKey: modelRegistry.resolver(model, this.session.getSessionId?.() ?? undefined),
 				signal,
 			},
 			{ telemetry, oneshotKind: "inspect_image", completeImpl: this.completeImageRequest },

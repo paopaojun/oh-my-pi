@@ -1,7 +1,7 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import { jsBackend, pythonBackend } from "../eval";
 import type { ExecutorBackend, ExecutorBackendResult } from "../eval/backend";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../eval/bridge-timeout";
@@ -10,6 +10,7 @@ import { defaultEvalSessionId } from "../eval/session-id";
 import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, EvalToolDetails } from "../eval/types";
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
+import { webpExclusionForModel } from "../utils/image-loading";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
@@ -30,7 +31,7 @@ const evalCellSchema = z.object({
 	language: z.enum(["py", "js"]).describe('runtime: "py" for the IPython kernel, "js" for the persistent JS VM'),
 	code: z.string().describe("cell body, verbatim. Use top-level await freely."),
 	title: z.string().optional().describe('short label shown in transcript (e.g. "imports", "load config")'),
-	timeout: z.number().int().min(1).max(600).optional().describe("per-cell timeout in seconds (1-600, default 30)"),
+	timeout: z.number().int().min(1).max(3600).optional().describe("per-cell timeout in seconds (1-3600, default 30)"),
 	reset: z
 		.boolean()
 		.optional()
@@ -88,12 +89,21 @@ function formatDisplayOutputsForText(outputs: EvalDisplayOutput[]): string {
 export interface EvalToolDescriptionOptions {
 	py?: boolean;
 	js?: boolean;
+	/**
+	 * Whether `agent()` is allowed in this session. Driven by the parent's
+	 * spawn policy (`getSessionSpawns`). Defaults to `true` for backward
+	 * compatibility — when the session forbids spawning, the prelude doc
+	 * omits the `agent()` entry so the model does not promise itself a
+	 * helper that will only ever throw "spawns disabled".
+	 */
+	spawns?: boolean;
 }
 
 export function getEvalToolDescription(options: EvalToolDescriptionOptions = {}): string {
 	const py = options.py ?? true;
 	const js = options.js ?? true;
-	return prompt.render(evalDescription, { py, js });
+	const spawns = options.spawns ?? true;
+	return prompt.render(evalDescription, { py, js, spawns });
 }
 
 export interface EvalToolOptions {
@@ -169,7 +179,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	get description(): string {
 		if (!this.session) return getEvalToolDescription();
 		const backends = resolveEvalBackends(this.session);
-		return getEvalToolDescription({ py: backends.python, js: backends.js });
+		const sessionSpawns = this.session.getSessionSpawns?.() ?? "*";
+		const spawnsAllowed = sessionSpawns !== "" && sessionSpawns !== null;
+		return getEvalToolDescription({ py: backends.python, js: backends.js, spawns: spawnsAllowed });
 	}
 	readonly parameters = evalSchema;
 	readonly concurrency = "exclusive";
@@ -208,6 +220,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			throw new ToolError("Eval tool requires a session when not using proxy executor");
 		}
 		const session = this.session;
+		const excludeWebP = webpExclusionForModel(session.getActiveModel?.());
 
 		const cells: ResolvedEvalCell[] = [];
 		for (let i = 0; i < params.cells.length; i++) {
@@ -315,7 +328,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					const cell = cells[i];
 					const backend = cell.resolved.backend;
 					// The per-cell `timeout` is a budget on the cell runtime's *own*
-					// work. Host-side `agent()`/`parallel()`/`llm()` bridge calls suspend
+					// work. Host-side `agent()`/`parallel()`/`completion()` bridge calls suspend
 					// that budget entirely and restart a fresh timeout window when control
 					// returns to Python/JS. Compute, stdout, `log()`/`phase()`, and
 					// ordinary tool calls all count against the budget. The watchdog drives
@@ -347,8 +360,6 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							session,
 							idleTimeoutMs,
 							reset: cell.reset,
-							artifactPath,
-							artifactId,
 							onChunk: chunk => {
 								outputSink!.push(chunk);
 							},
@@ -381,11 +392,14 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 							cellDisplayOutputs.push(output);
 						}
 						if (output.type === "image") {
-							const resized = await resizeImage({
-								type: "image",
-								data: output.data,
-								mimeType: output.mimeType,
-							});
+							const resized = await resizeImage(
+								{
+									type: "image",
+									data: output.data,
+									mimeType: output.mimeType,
+								},
+								{ excludeWebP },
+							);
 							const image: ImageContent = {
 								type: "image",
 								data: resized.data,

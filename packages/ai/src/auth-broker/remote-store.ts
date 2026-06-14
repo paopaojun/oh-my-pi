@@ -17,9 +17,9 @@ import {
 	REMOTE_REFRESH_SENTINEL,
 	type StoredAuthCredential,
 } from "../auth-storage";
+import type { OAuthCredentials } from "../registry/oauth/types";
 import type { Provider } from "../types";
 import type { UsageReport } from "../usage";
-import type { OAuthCredentials } from "../utils/oauth/types";
 import { type AuthBrokerClient, AuthBrokerStreamUnsupportedError } from "./client";
 import type { RefresherSchedule, SnapshotEntry, SnapshotResponse, SnapshotStreamEvent } from "./types";
 
@@ -273,6 +273,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#client.disableCredential(id, disabledCause).catch(error => {
 			logger.warn("auth-broker disable propagation failed", { id, error: String(error) });
 		});
+	}
+
+	async deleteAuthCredentialRemote(id: number, disabledCause: string): Promise<boolean> {
+		const found = this.#snapshot.credentials.some(entry => entry.id === id);
+		if (!found) return false;
+		await this.#client.disableCredential(id, disabledCause);
+		this.#removeCredentialById(id);
+		this.#maybeRefreshSnapshot("delete credential");
+		return true;
 	}
 
 	tryDisableAuthCredentialIfMatches(id: number, _expectedData: string, disabledCause: string): boolean {

@@ -1,7 +1,7 @@
 /**
  * CLI argument parsing and help display
  */
-import { type Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-ai/effort";
+import { type Effort, THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { APP_NAME, CONFIG_DIR_NAME, logger } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { parseEffort } from "../thinking";
@@ -14,6 +14,7 @@ export interface Args {
 	allowHome?: boolean;
 	provider?: string;
 	model?: string;
+	config?: string[];
 	smol?: string;
 	slow?: string;
 	plan?: string;
@@ -31,6 +32,8 @@ export interface Args {
 	sessionDir?: string;
 	providerSessionId?: string;
 	fork?: string;
+	/** Collab link to join at startup (set by the `join` subcommand; no CLI flag). */
+	join?: string;
 	models?: string[];
 	tools?: string[];
 	noTools?: boolean;
@@ -45,14 +48,24 @@ export interface Args {
 	noSkills?: boolean;
 	skills?: string[];
 	noRules?: boolean;
-	listModels?: string | true;
 	noTitle?: boolean;
 	autoApprove?: boolean;
 	approvalMode?: "always-ask" | "write" | "yolo";
 	messages: string[];
 	fileArgs: string[];
-	/** Unknown flags (potentially extension flags) - map of flag name to value */
+	/** Extension-registered flags this parse recognized — name to value. */
 	unknownFlags: Map<string, boolean | string>;
+	/**
+	 * `--`/`-` prefixed tokens this parse could not match against any built-in
+	 * or {@link extensionFlags} entry. The startup parse runs *before*
+	 * extensions load, so it always lists every extension-registered flag here;
+	 * the post-extension reparse in {@link applyExtensionFlags} clears those
+	 * once the real flag set is known. Anything still present after that
+	 * reparse is a genuine typo or stale flag and {@link reportUnrecognizedFlags}
+	 * surfaces it as a hard error so the agent does not silently start a
+	 * session with the misparsed positionals as a prompt (issue #2459).
+	 */
+	unrecognizedFlags: string[];
 }
 
 export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { type: "boolean" | "string" }>): Args {
@@ -65,6 +78,7 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		messages: [],
 		fileArgs: [],
 		unknownFlags: new Map(),
+		unrecognizedFlags: [],
 	};
 
 	for (let i = 0; i < args.length; i++) {
@@ -109,6 +123,10 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.version = true;
 		} else if (arg === "--allow-home") {
 			result.allowHome = true;
+		} else if (arg === "--cwd" && i + 1 < args.length) {
+			result.cwd = args[++i];
+		} else if (arg === "--config" && i + 1 < args.length) {
+			result.config = [...(result.config ?? []), args[++i]];
 		} else if (arg === "--mode" && i + 1 < args.length) {
 			const mode = args[++i];
 			if (mode === "text" || mode === "json" || mode === "rpc" || mode === "acp" || mode === "rpc-ui") {
@@ -221,17 +239,19 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 		} else if (arg === "--skills" && i + 1 < args.length) {
 			// Comma-separated glob patterns for skill filtering
 			result.skills = args[++i].split(",").map(s => s.trim());
-		} else if (arg === "--list-models") {
-			// Check if next arg is a search pattern (not a flag or file arg)
-			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {
-				result.listModels = args[++i];
-			} else {
-				result.listModels = true;
-			}
 		} else if (arg.startsWith("@")) {
 			result.fileArgs.push(arg.slice(1)); // Remove @ prefix
-		} else if (!arg.startsWith("-")) {
-			result.messages.push(arg);
+		} else if (!arg.startsWith("-") || arg === "-" || arg === "--") {
+			// Plain positional, lone `-` (stdin marker), or POSIX positional
+			// separator `--` — pass through as a message rather than flagging it.
+			if (arg !== "--") result.messages.push(arg);
+		} else {
+			// Flag-shaped (`-x`, `--name`) but unrecognized at this parse. Record
+			// it so the post-extension reparse can decide whether to surface it
+			// as a hard error. `--flag=value` already split `value` into the next
+			// slot; the standard "drop unconsumed equals value" guard below
+			// removes it so it does not leak into messages (issue #2459).
+			result.unrecognizedFlags.push(arg);
 		}
 		// Drop an unconsumed `--flag=value` value (e.g. a boolean flag): when no
 		// branch advanced past the spliced token, remove it so it does not fall
@@ -242,6 +262,24 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 	}
 
 	return result;
+}
+
+/**
+ * Emit a stderr error listing the unrecognized flags and return `true` when
+ * there were any. Caller is expected to exit with a non-zero status. Splitting
+ * the print from the exit keeps the helper unit-testable without forking a
+ * process (issue #2459).
+ */
+export function reportUnrecognizedFlags(
+	args: Pick<Args, "unrecognizedFlags">,
+	write: (text: string) => void = text => process.stderr.write(text),
+): boolean {
+	if (args.unrecognizedFlags.length === 0) return false;
+	const flags = args.unrecognizedFlags;
+	const plural = flags.length === 1 ? "" : "s";
+	write(`${chalk.red(`Error: unknown flag${plural}: ${flags.join(", ")}`)}\n`);
+	write(`Run \`${APP_NAME} --help\` for available flags.\n`);
+	return true;
 }
 
 export function getExtraHelpText(): string {
@@ -258,7 +296,7 @@ export function getExtraHelpText(): string {
   NODE_EXTRA_CA_CERTS        - CA bundle path (or inline PEM) for server certificate validation
   OPENAI_API_KEY             - OpenAI GPT models
   GEMINI_API_KEY             - Google Gemini models
-  GITHUB_TOKEN               - GitHub Copilot (or GH_TOKEN, COPILOT_GITHUB_TOKEN)
+  COPILOT_GITHUB_TOKEN      - GitHub Copilot
 
   ${chalk.dim("# Additional LLM Providers")}
   AZURE_OPENAI_API_KEY       - Azure OpenAI models

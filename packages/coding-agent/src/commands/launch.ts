@@ -2,7 +2,7 @@
  * Root command for the coding agent CLI.
  */
 
-import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai/effort";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { APP_NAME } from "@oh-my-pi/pi-utils";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { parseArgs } from "../cli/args";
@@ -49,9 +49,16 @@ export default class Index extends Command {
 		"allow-home": Flags.boolean({
 			description: "Allow starting in ~ without auto-switching to a temp dir",
 		}),
+		cwd: Flags.string({
+			description: "Directory to start in (overrides the launch cwd)",
+		}),
 		mode: Flags.string({
 			description: "Output mode: text (default), json, rpc, or rpc-ui",
 			options: ["text", "json", "rpc", "acp", "rpc-ui"],
+		}),
+		config: Flags.string({
+			description: "Load an extra config.yml-style overlay for this run (repeatable)",
+			multiple: true,
 		}),
 		print: Flags.boolean({
 			char: "p",
@@ -116,9 +123,6 @@ export default class Index extends Command {
 		}),
 		export: Flags.string({
 			description: "Export session file to HTML and exit",
-		}),
-		"list-models": Flags.string({
-			description: "List available models (with optional fuzzy search)",
 		}),
 		"no-title": Flags.boolean({
 			description: "Disable title auto-generation",

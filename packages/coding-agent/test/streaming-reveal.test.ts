@@ -52,9 +52,11 @@ function thinkingAt(message: AssistantMessage, index: number): string {
 
 class RecordingComponent {
 	messages: AssistantMessage[] = [];
+	transientFlags: Array<boolean | undefined> = [];
 
-	updateContent(message: AssistantMessage): void {
+	updateContent(message: AssistantMessage, opts?: { transient?: boolean }): void {
 		this.messages.push(message);
+		this.transientFlags.push(opts?.transient);
 	}
 }
 
@@ -101,6 +103,17 @@ describe("streaming reveal", () => {
 
 		expect(display.content[0]).toBe(thinkingBlock);
 		expect(thinkingAt(display, 0)).toBe("thought");
+		expect(textAt(display, 1)).toBe("a");
+	});
+
+	it("excludes dot-only reasoning placeholders from the reveal budget", () => {
+		const thinkingBlock = { type: "thinking" as const, thinking: "...", thinkingSignature: "reasoning_content" };
+		const target = makeMessage([thinkingBlock, { type: "text", text: "answer" }]);
+
+		expect(visibleUnits(target, false)).toBe("answer".length);
+		const display = buildDisplayMessage(target, 1, false);
+
+		expect(display.content[0]).toBe(thinkingBlock);
 		expect(textAt(display, 1)).toBe("a");
 	});
 
@@ -151,6 +164,24 @@ describe("streaming reveal", () => {
 		}
 	});
 
+	it("keeps grapheme counts correct when an append extends the final cluster", () => {
+		vi.useFakeTimers();
+		const { component, controller } = makeController();
+
+		controller.begin(component, makeMessage([{ type: "text", text: "" }]));
+		controller.setTarget(makeMessage([{ type: "text", text: "ab👨" }]));
+		vi.advanceTimersByTime(STREAMING_REVEAL_FRAME_MS);
+		// The appended ZWJ sequence merges into the previous final grapheme:
+		// "👨" + "\u200D👩" becomes a single cluster, so the cached per-block
+		// count must re-segment from that cluster, not just add the suffix.
+		controller.setTarget(makeMessage([{ type: "text", text: "ab👨\u200D👩x" }]));
+		for (let i = 0; i < 6; i++) {
+			vi.advanceTimersByTime(STREAMING_REVEAL_FRAME_MS);
+		}
+
+		expect(textAt(latestMessage(component), 0)).toBe("ab👨\u200D👩x");
+	});
+
 	it("renders full targets immediately when smoothing is disabled", () => {
 		vi.useFakeTimers();
 		const requestRender = vi.fn();
@@ -164,6 +195,28 @@ describe("streaming reveal", () => {
 		expect(textAt(latestMessage(component), 0)).toBe("chunky");
 		expect(component.messages).toHaveLength(updates);
 		expect(requestRender).not.toHaveBeenCalled();
+	});
+
+	it("marks unsmoothed in-flight updates as transient", () => {
+		const { component, controller } = makeController({ smooth: false });
+
+		controller.begin(component, makeMessage([{ type: "text", text: "chunk" }]));
+		controller.setTarget(makeMessage([{ type: "text", text: "chunky" }]));
+
+		expect(component.transientFlags).toEqual([true, true]);
+	});
+
+	it("keeps smooth catch-up renders transient until the final message_end render", () => {
+		vi.useFakeTimers();
+		const { component, controller } = makeController();
+
+		controller.begin(component, makeMessage([{ type: "text", text: "" }]));
+		controller.setTarget(makeMessage([{ type: "text", text: "abc" }]));
+		vi.advanceTimersByTime(STREAMING_REVEAL_FRAME_MS);
+
+		expect(textAt(latestMessage(component), 0)).toBe("abc");
+		expect(component.transientFlags).not.toHaveLength(0);
+		expect(component.transientFlags.every(flag => flag === true)).toBe(true);
 	});
 
 	it("ticks increasing prefixes at the render cadence", () => {

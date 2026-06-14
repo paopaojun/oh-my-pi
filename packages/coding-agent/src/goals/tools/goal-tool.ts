@@ -2,7 +2,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { formatNumber, prompt } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import type { Theme, ThemeColor } from "../../modes/theme/theme";
 import goalDescription from "../../prompts/tools/goal.md" with { type: "text" };
@@ -209,7 +209,7 @@ export const goalToolRenderer = {
 
 		const header = renderStatusLine(
 			{
-				icon: "success",
+				iconOverride: uiTheme.styledSymbol("tool.goal", "accent"),
 				title: "Goal",
 				description,
 				badge: { label: goal.status, color: goalBadgeColor(goal.status) },
